@@ -64,14 +64,6 @@ pub enum DataKey {
     GlobalMetadataMaxSize,
     /// Signature stored for an event (issue #69): (pubkey, signature).
     EventSignature(BytesN<32>),
-    /// Cached event count per type (issue #52). Updated alongside EventTypeIndices.
-    EventTypeCount(Symbol),
-    /// Lightweight header (issue #56): EventHeader stored separately from metadata.
-    EventHeaderKey(BytesN<32>),
-    /// Optimized storage for event headers (issue #53): (index, timestamp, event_type, submitter).
-    EventMeta(BytesN<32>),
-    /// Optimized storage for event metadata alone (issue #53).
-    EventMetadata(BytesN<32>),
     /// Event emission configuration (issue #60): 0=full, 1=index-only, 2=hash-only, 3=none.
     EventEmissionConfig,
     /// Event emission version (issue #60): 1=full metadata, 2=index-only.
@@ -248,35 +240,9 @@ impl AuditLedger {
             .instance()
             .set(&DataKey::EventOrder(index), &event_id);
 
-        // --- issue #56: store lightweight header separately ---
-        let header = EventHeader {
-            index,
-            timestamp,
-            event_type: event_type.clone(),
-            submitter: submitter.clone(),
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::EventHeaderKey(event_id.clone()), &header);
-        env.storage()
-            .instance()
-            .set(&DataKey::EventMeta(event_id.clone()), &evt);
-        env.storage()
-            .instance()
-            .set(&DataKey::EventMetadata(event_id.clone()), &metadata);
-
         // --- issue #54: packed-Bytes index storage ---
         if !Self::effective_low_cost_mode(&env) {
             Self::push_type_index(&env, event_type.clone(), index);
-            let mut count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::EventTypeCount(event_type.clone()))
-                .unwrap_or(0);
-            count += 1;
-            env.storage()
-                .instance()
-                .set(&DataKey::EventTypeCount(event_type.clone()), &count);
         }
         
         if Self::effective_low_cost_mode(&env) {
@@ -345,22 +311,31 @@ impl AuditLedger {
     
     /// Retrieve only the event metadata (optimized for low-fee environments, issue #57).
     pub fn get_event_metadata(env: Env, id: BytesN<32>) -> Bytes {
-        env.storage()
+        let evt: Event = env
+            .storage()
             .instance()
-            .get(&DataKey::EventMetadata(id))
+            .get(&DataKey::EventData(id))
             .unwrap_or_else(|| {
                 panic_with_error!(&env, ContractError::EventDoesNotExist);
-            })
+            });
+        evt.metadata
     }
     
     /// Retrieve only the event header (index, timestamp, event_type, submitter) — no metadata (issue #56).
     pub fn get_event_header(env: Env, id: BytesN<32>) -> EventHeader {
-        env.storage()
+        let evt: Event = env
+            .storage()
             .instance()
-            .get(&DataKey::EventHeaderKey(id))
+            .get(&DataKey::EventData(id))
             .unwrap_or_else(|| {
                 panic_with_error!(&env, ContractError::EventDoesNotExist);
-            })
+            });
+        EventHeader {
+            index: evt.index,
+            timestamp: evt.timestamp,
+            event_type: evt.event_type,
+            submitter: evt.submitter,
+        }
     }
 
     /// Retrieve an event by its sequential insertion order (0-based).
@@ -458,11 +433,11 @@ impl AuditLedger {
             if !env
                 .storage()
                 .instance()
-                .has(&DataKey::EventTypeCount(event_type.clone()))
+                .has(&DataKey::EventTypeIndices(event_type.clone()))
             {
                 env.storage()
                     .instance()
-                    .set(&DataKey::EventTypeCount(event_type.clone()), &0u32);
+                    .set(&DataKey::EventTypeIndices(event_type.clone()), &Bytes::new(&env));
             }
         }
     }
@@ -486,15 +461,6 @@ impl AuditLedger {
         env.storage()
             .instance()
             .remove(&DataKey::EventMaxLogs(event_type.clone()));
-        env.storage()
-            .instance()
-            .remove(&DataKey::EventTypeCount(event_type.clone()));
-        
-        if Self::effective_low_cost_mode(&env) {
-            env.storage()
-                .instance()
-                .remove(&DataKey::EventTypeIndices(event_type.clone()));
-        }
     }
 
     pub fn transfer_ownership(env: Env, caller: Address, new_owner: Address) {
@@ -654,16 +620,6 @@ impl AuditLedger {
                         .remove(&DataKey::EventTypeIndices(et.clone()));
                     removed += 1;
                 }
-                if env
-                    .storage()
-                    .instance()
-                    .has(&DataKey::EventTypeCount(et.clone()))
-                {
-                    env.storage()
-                        .instance()
-                        .remove(&DataKey::EventTypeCount(et.clone()));
-                    removed += 1;
-                }
             }
         }
 
@@ -785,10 +741,12 @@ impl AuditLedger {
     }
 
     fn event_type_count(env: &Env, event_type: Symbol) -> u32 {
-        env.storage()
+        let packed: Bytes = env
+            .storage()
             .instance()
-            .get(&DataKey::EventTypeCount(event_type))
-            .unwrap_or(0)
+            .get(&DataKey::EventTypeIndices(event_type))
+            .unwrap_or(Bytes::new(env));
+        packed.len() / 4
     }
 
     /// Compute a content-addressed event ID (issue #70).
