@@ -82,11 +82,95 @@ fn test_get_nonexistent_event_panics() {
 }
 
 #[test]
-#[should_panic(expected = "HostError: Error(Contract, #5)")]
-fn test_get_event_by_type_out_of_bounds_panics() {
+#[should_panic(expected = "HostError: Error(Contract, #15)")]
+fn test_initialize_reinitialization_panics() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let contract_id = env.register(AuditLedger, ());
+    let client = AuditLedgerClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.initialize(&owner, &100);
+    client.initialize(&owner, &200);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #14)")]
+fn test_get_event_by_type_no_events_returns_no_events_for_type() {
     let (_env, _owner, client) = create_ledger();
     let payment = symbol_short!("payment");
     client.get_event_by_type(&payment, &0);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #5)")]
+fn test_get_event_by_type_with_bad_index_panics() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
+    client.get_event_by_type(&payment, &1);
+}
+
+#[test]
+fn test_event_count_and_total_events_with_empty_metadata() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::new(&env));
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"non-empty"));
+
+    assert_eq!(client.total_events(), 2);
+    assert_eq!(client.event_count(&payment), 2);
+
+    let evt0 = client.get_event_by_type(&payment, &0);
+    let evt1 = client.get_event_by_type(&payment, &1);
+    assert_eq!(evt0.metadata.len(), 0);
+    assert_eq!(evt1.metadata, Bytes::from_slice(&env, b"non-empty"));
+}
+
+#[test]
+fn test_batch_log_events_logs_each_event_atomically() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    let events = soroban_sdk::vec![&env,
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"a")),
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"b")),
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"c")),
+    ];
+
+    let indices = client.log_events(&events);
+    assert_eq!(indices.len(), 3);
+    assert_eq!(client.total_events(), 3);
+    assert_eq!(client.event_count(&payment), 3);
+    assert_eq!(client.get_event_by_type(&payment, &0).metadata, Bytes::from_slice(&env, b"a"));
+    assert_eq!(client.get_event_by_type(&payment, &2).metadata, Bytes::from_slice(&env, b"c"));
+}
+
+#[test]
+fn test_batch_log_events_exceeds_type_cap_reverts() {
+    let (env, owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.set_event_max_logs(&owner, &payment, &2);
+
+    let events = soroban_sdk::vec![&env,
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"a")),
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"b")),
+        (submitter.clone(), payment.clone(), Bytes::from_slice(&env, b"c")),
+    ];
+
+    let result = client.try_log_events(&events);
+    assert!(result.is_err());
 }
 
 // ── issue #70: hash-based IDs ───────────────────────────────────────────────
@@ -420,6 +504,126 @@ fn test_log_event_returns_correct_fields() {
     assert_eq!(evt.submitter, submitter);
     assert_eq!(evt.metadata, meta);
     assert_eq!(evt.timestamp, 1000);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #9)")]
+fn test_total_events_before_initialize_panics() {
+    let env = Env::default();
+    let submitter = Address::generate(&env);
+    let contract_id = env.register(AuditLedger, ());
+    let client = AuditLedgerClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.total_events();
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #9)")]
+fn test_log_event_before_initialize_panics() {
+    let env = Env::default();
+    let submitter = Address::generate(&env);
+    let contract_id = env.register(AuditLedger, ());
+    let client = AuditLedgerClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.log_event(&submitter, &symbol_short!("payment"), &Bytes::from_slice(&env, b"tx1"));
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #11)")]
+fn test_log_event_rejects_past_timestamp() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.ledger().set_timestamp(1000);
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
+
+    env.ledger().set_timestamp(999);
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"));
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #11)")]
+fn test_log_event_rejects_future_timestamp() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.ledger().set_timestamp(1000);
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
+
+    env.ledger().set_timestamp(1000 + super::MAX_TIMESTAMP_DRIFT_SECONDS + 1);
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"));
+}
+
+#[test]
+fn test_log_event_accepts_normal_timestamp_progression() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.ledger().set_timestamp(1000);
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
+
+    env.ledger().set_timestamp(1001);
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"));
+
+    assert_eq!(client.total_events(), 2);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #10)")]
+fn test_log_event_rejects_total_events_overflow() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let contract_id = env.register(AuditLedger, ());
+    let client = AuditLedgerClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.initialize(&owner, &u32::MAX);
+    env.storage().instance().set(&super::DataKey::TotalEvents, &u32::MAX);
+
+    let submitter = Address::generate(&env);
+    client.log_event(&submitter, &symbol_short!("payment"), &Bytes::from_slice(&env, b"tx1"));
+}
+
+#[test]
+fn test_get_statistics_returns_aggregates() {
+    let (env, _owner, client) = create_ledger();
+    let submitter_a = Address::generate(&env);
+    let submitter_b = Address::generate(&env);
+    let payment = symbol_short!("payment");
+    let refund = symbol_short!("refund");
+
+    env.ledger().set_timestamp(1000);
+    env.mock_all_auths();
+    client.log_event(&submitter_a, &payment, &Bytes::from_slice(&env, b"t1"));
+    env.ledger().set_timestamp(1001);
+    client.log_event(&submitter_b, &refund, &Bytes::from_slice(&env, b"t2"));
+    env.ledger().set_timestamp(1002);
+    client.log_event(&submitter_a, &payment, &Bytes::from_slice(&env, b"t3"));
+
+    let stats = client.get_statistics();
+    assert_eq!(stats.total_events, 3);
+    assert_eq!(stats.events_last_hour, 3);
+    assert_eq!(stats.events_last_day, 3);
+    assert_eq!(stats.events_last_week, 3);
+    assert_eq!(stats.events_by_type.len(), 2);
+    assert_eq!(stats.top_submitters.len(), 2);
+}
+
+#[test]
+fn test_get_statistics_empty_ledger() {
+    let (_env, _owner, client) = create_ledger();
+    let stats = client.get_statistics();
+    assert_eq!(stats.total_events, 0);
+    assert_eq!(stats.events_last_hour, 0);
+    assert_eq!(stats.events_by_type.len(), 0);
 }
 
 #[test]
@@ -911,4 +1115,143 @@ fn test_compact_storage_does_not_touch_active_caps() {
     // payment cap still works
     client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"p2"));
     assert_eq!(client.event_count(&payment), 2);
+}
+
+// ── issue #64: nonce-based replay prevention ─────────────────────────────────
+
+#[test]
+fn test_nonce_correct_increments() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    // nonce starts at 0 (absent); first accepted nonce is 1
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"), &1);
+    assert_eq!(client.get_submitter_nonce(&submitter), 1);
+
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"), &2);
+    assert_eq!(client.get_submitter_nonce(&submitter), 2);
+}
+
+#[test]
+fn test_nonce_replay_rejected_with_nonce_too_low() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"), &1);
+
+    // Re-submitting the same nonce must fail with NonceTooLow (#12)
+    let result = client.try_log_event_with_nonce(
+        &submitter,
+        &payment,
+        &Bytes::from_slice(&env, b"tx1"),
+        &1,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #12)")]
+fn test_nonce_too_low_error_code() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"), &5);
+    // nonce 3 < 5 → NonceTooLow
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"), &3);
+}
+
+#[test]
+fn test_nonce_gap_accepted() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    // Jump from 0 → 5 directly (gap is accepted)
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"), &5);
+    assert_eq!(client.get_submitter_nonce(&submitter), 5);
+
+    // Next must be > 5
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"tx2"), &10);
+    assert_eq!(client.get_submitter_nonce(&submitter), 10);
+}
+
+#[test]
+fn test_nonce_zero_rejected() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    // nonce 0 is never valid
+    let result = client.try_log_event_with_nonce(
+        &submitter,
+        &payment,
+        &Bytes::from_slice(&env, b"tx"),
+        &0,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_nonce_multiple_submitters_independent() {
+    let (env, _owner, client) = create_ledger();
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    // s1 uses nonce 1, s2 independently uses nonce 1
+    client.log_event_with_nonce(&s1, &payment, &Bytes::from_slice(&env, b"a"), &1);
+    client.log_event_with_nonce(&s2, &payment, &Bytes::from_slice(&env, b"b"), &1);
+
+    assert_eq!(client.get_submitter_nonce(&s1), 1);
+    assert_eq!(client.get_submitter_nonce(&s2), 1);
+
+    // s1 advances to 2; s2 stays at 1 until it submits
+    client.log_event_with_nonce(&s1, &payment, &Bytes::from_slice(&env, b"c"), &2);
+    assert_eq!(client.get_submitter_nonce(&s1), 2);
+    assert_eq!(client.get_submitter_nonce(&s2), 1);
+
+    // s1 replay attempt fails
+    let result = client.try_log_event_with_nonce(
+        &s1,
+        &payment,
+        &Bytes::from_slice(&env, b"c"),
+        &2,
+    );
+    assert!(result.is_err());
+
+    // s2 is unaffected and can advance
+    client.log_event_with_nonce(&s2, &payment, &Bytes::from_slice(&env, b"d"), &2);
+    assert_eq!(client.get_submitter_nonce(&s2), 2);
+}
+
+#[test]
+fn test_get_submitter_nonce_default_zero() {
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    assert_eq!(client.get_submitter_nonce(&submitter), 0);
+}
+
+#[test]
+fn test_log_event_without_nonce_unaffected() {
+    // log_event (no nonce) does not touch the nonce counter
+    let (env, _owner, client) = create_ledger();
+    let submitter = Address::generate(&env);
+    let payment = symbol_short!("payment");
+
+    env.mock_all_auths();
+    client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"legacy"));
+    // nonce counter remains 0
+    assert_eq!(client.get_submitter_nonce(&submitter), 0);
+    // log_event_with_nonce still works independently
+    client.log_event_with_nonce(&submitter, &payment, &Bytes::from_slice(&env, b"nonce"), &1);
+    assert_eq!(client.get_submitter_nonce(&submitter), 1);
 }
