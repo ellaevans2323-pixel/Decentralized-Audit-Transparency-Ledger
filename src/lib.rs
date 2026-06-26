@@ -49,28 +49,13 @@ pub struct EventHeader {
     pub submitter: Address,
 }
 
-/// Proposal action variants for multisig governance
 #[contracttype]
-#[derive(Clone)]
-pub enum ProposalAction {
-    TransferOwnership(Address),
-    AddOwner(Address),
-    RemoveOwner(Address),
-    SetRequiredSignatures(u32),
-    SetGlobalMaxLogs(u32),
-    Pause,
-    Unpause,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Proposal {
-    pub id: u32,
-    pub proposer: Address,
-    pub action: ProposalAction,
-    pub approvals: Vec<Address>,
-    pub expires_at: u64,
-    pub executed: bool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventVersion {
+    pub version: u32,
+    pub data: Event,
+    pub updated_at: u64,
+    pub updated_by: Address,
 }
 
 #[derive(Clone)]
@@ -107,22 +92,8 @@ pub enum DataKey {
     EventMeta(BytesN<32>),
     /// Optimized storage for event metadata alone (issue #53).
     EventMetadata(BytesN<32>),
-    /// Flag marking an event as archived (id -> bool)
-    EventArchivedFlag(BytesN<32>),
-    /// Archived event storage: id -> Event
-    ArchivedEventData(BytesN<32>),
-    /// Archived event order: archived_index -> id
-    ArchivedEventOrder(u32),
-    /// Archived total events counter
-    ArchivedTotalEvents,
-    /// Archived event header key
-    ArchivedEventHeaderKey(BytesN<32>),
-    /// Archived event metadata
-    ArchivedEventMetadata(BytesN<32>),
-    /// Proposal count
-    ProposalCount,
-    /// Proposal storage: id -> Proposal
-    Proposal(u32),
+    /// Stored update history for events indexed by event order.
+    EventVersions(u32),
     /// Event emission configuration (issue #60): 0=full, 1=index-only, 2=hash-only, 3=none.
     EventEmissionConfig,
     /// Event emission version (issue #60): 1=full metadata, 2=index-only.
@@ -153,8 +124,7 @@ pub enum ContractError {
     InvalidSignature = 9,
     ContractPaused = 10,
     RateLimitExceeded = 11,
-    NoEventsForType = 14,
-    AlreadyInitialized = 15,
+    InvalidPaginationParams = 12,
 }
 
 const NULL_ACCOUNT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -856,6 +826,317 @@ impl AuditLedger {
             .unwrap_or_else(|| {
                 panic_with_error!(&env, ContractError::EventDoesNotExist);
             })
+    }
+
+    pub fn list_events(env: Env, offset: u32, limit: u32) -> Vec<Event> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        if limit > 100 {
+            panic_with_error!(&env, ContractError::InvalidPaginationParams);
+        }
+
+        let total = Self::total_events(&env);
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let end = (offset.saturating_add(limit)).min(total);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            results.push_back(Self::get_event_by_order(env.clone(), i));
+        }
+        results
+    }
+
+    pub fn list_events_by_type(
+        env: Env,
+        event_type: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Event> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        if limit > 100 {
+            panic_with_error!(&env, ContractError::InvalidPaginationParams);
+        }
+
+        let total = Self::event_count(&env, event_type.clone());
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let end = (offset.saturating_add(limit)).min(total);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            results.push_back(Self::get_event_by_type(env.clone(), event_type.clone(), i));
+        }
+        results
+    }
+
+    pub fn get_events_by_time_range(
+        env: Env,
+        start_time: u64,
+        end_time: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Event> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        if limit > 100 {
+            panic_with_error!(&env, ContractError::InvalidPaginationParams);
+        }
+        if end_time < start_time {
+            return Vec::new(&env);
+        }
+
+        let total = Self::total_events(&env);
+        let mut matches = Vec::new(&env);
+        for i in 0..total {
+            let evt = Self::get_event_by_order(env.clone(), i);
+            if evt.timestamp >= start_time && evt.timestamp <= end_time {
+                matches.push_back(evt);
+            }
+        }
+
+        let matched_count = matches.len();
+        if offset >= matched_count {
+            return Vec::new(&env);
+        }
+
+        let end = (offset.saturating_add(limit)).min(matched_count);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            results.push_back(matches.get(i).unwrap());
+        }
+        results
+    }
+
+    pub fn search_events(env: Env, query: Bytes, offset: u32, limit: u32) -> Vec<Event> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        if limit > 100 {
+            panic_with_error!(&env, ContractError::InvalidPaginationParams);
+        }
+
+        let total = Self::total_events(&env);
+        let mut matches = Vec::new(&env);
+        for i in 0..total {
+            let evt = Self::get_event_by_order(env.clone(), i);
+            if Self::bytes_contains(&evt.metadata, &query) {
+                matches.push_back(evt);
+            }
+        }
+
+        let matched_count = matches.len();
+        if offset >= matched_count {
+            return Vec::new(&env);
+        }
+
+        let end = (offset.saturating_add(limit)).min(matched_count);
+        let mut results = Vec::new(&env);
+        for i in offset..end {
+            results.push_back(matches.get(i).unwrap());
+        }
+        results
+    }
+
+    pub fn update_event(
+        env: Env,
+        caller: Address,
+        index: u32,
+        new_metadata: Bytes,
+    ) -> BytesN<32> {
+        caller.require_auth();
+        Self::require_owner(&env, &caller);
+
+        let total = Self::total_events(&env);
+        if index >= total {
+            panic_with_error!(&env, ContractError::EventDoesNotExist);
+        }
+
+        let current_id: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EventOrder(index))
+            .unwrap();
+        let current_event: Event = env
+            .storage()
+            .instance()
+            .get(&DataKey::EventData(current_id.clone()))
+            .unwrap();
+
+        let max_meta = Self::effective_metadata_max_size(&env, &current_event.event_type);
+        if new_metadata.len() > max_meta {
+            panic_with_error!(&env, ContractError::MetadataTooLarge);
+        }
+
+        let new_id = Self::compute_event_id(
+            &env,
+            &current_event.submitter,
+            &current_event.event_type,
+            &new_metadata,
+            current_event.timestamp,
+            index,
+        );
+
+        if new_id == current_id {
+            return current_id;
+        }
+
+        let mut versions: Vec<EventVersion> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EventVersions(index))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if versions.len() == 0 {
+            let original_version = EventVersion {
+                version: 0,
+                data: current_event.clone(),
+                updated_at: current_event.timestamp,
+                updated_by: current_event.submitter.clone(),
+            };
+            versions.push_back(original_version);
+        }
+
+        let prev_hash: BytesN<32> = if index == 0 {
+            BytesN::from_array(&env, &[0u8; 32])
+        } else {
+            let prev_id: BytesN<32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::EventOrder(index - 1))
+                .unwrap();
+            let prev_evt: Event = env
+                .storage()
+                .instance()
+                .get(&DataKey::EventData(prev_id))
+                .unwrap();
+            prev_evt.event_hash.clone()
+        };
+
+        let updated_event_hash = Self::compute_event_hash(
+            &env,
+            &new_id,
+            &prev_hash,
+            index,
+            current_event.timestamp,
+        );
+
+        let updated_event = Event {
+            index,
+            timestamp: current_event.timestamp,
+            event_type: current_event.event_type.clone(),
+            submitter: current_event.submitter.clone(),
+            metadata: new_metadata.clone(),
+            event_hash: updated_event_hash.clone(),
+            prev_hash: prev_hash.clone(),
+        };
+
+        let update_version = EventVersion {
+            version: versions.len(),
+            data: updated_event.clone(),
+            updated_at: env.ledger().timestamp(),
+            updated_by: caller.clone(),
+        };
+        versions.push_back(update_version);
+        env.storage()
+            .instance()
+            .set(&DataKey::EventVersions(index), &versions);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EventData(new_id.clone()), &updated_event);
+        env.storage()
+            .instance()
+            .set(&DataKey::EventOrder(index), &new_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::EventHeaderKey(new_id.clone()), &EventHeader {
+                index,
+                timestamp: current_event.timestamp,
+                event_type: current_event.event_type.clone(),
+                submitter: current_event.submitter.clone(),
+            });
+        env.storage()
+            .instance()
+            .set(&DataKey::EventMeta(new_id.clone()), &updated_event);
+        env.storage()
+            .instance()
+            .set(&DataKey::EventMetadata(new_id.clone()), &new_metadata);
+
+        let mut next_prev_hash = updated_event_hash;
+        for i in index + 1..total {
+            let event_id: BytesN<32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::EventOrder(i))
+                .unwrap();
+            let mut later_event: Event = env
+                .storage()
+                .instance()
+                .get(&DataKey::EventData(event_id.clone()))
+                .unwrap();
+            later_event.prev_hash = next_prev_hash.clone();
+            later_event.event_hash = Self::compute_event_hash(
+                &env,
+                &event_id,
+                &later_event.prev_hash,
+                i,
+                later_event.timestamp,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::EventData(event_id.clone()), &later_event);
+            env.storage()
+                .instance()
+                .set(&DataKey::EventMeta(event_id.clone()), &later_event);
+            next_prev_hash = later_event.event_hash.clone();
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "event_updated"),),
+            (index, current_id, new_id.clone(), caller, env.ledger().timestamp()),
+        );
+
+        new_id
+    }
+
+    pub fn get_event_history(env: Env, index: u32) -> Vec<EventVersion> {
+        let total = Self::total_events(&env);
+        if index >= total {
+            return Vec::new(&env);
+        }
+
+        if let Some(versions) = env.storage().instance().get::<_, Vec<EventVersion>>(
+            &DataKey::EventVersions(index),
+        ) {
+            return versions;
+        }
+
+        let event_id: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EventOrder(index))
+            .unwrap();
+        let event: Event = env
+            .storage()
+            .instance()
+            .get(&DataKey::EventData(event_id))
+            .unwrap();
+
+        let mut history = Vec::new(&env);
+        history.push_back(EventVersion {
+            version: 0,
+            data: event,
+            updated_at: event.timestamp,
+            updated_by: event.submitter.clone(),
+        });
+        history
     }
 
     // ── Integrity verification (issue #66) ──────────────────────────────────
@@ -1635,38 +1916,31 @@ impl AuditLedger {
         )
     }
 
-    fn increment_address_count(
-        env: &Env,
-        counts: &mut Vec<(Address, u32)>,
-        address: Address,
-    ) -> u32 {
-        for i in 0..counts.len() {
-            let (existing_address, existing_count) = counts.get(i).unwrap().clone();
-            if existing_address == address {
-                let new_count = existing_count + 1;
-                counts.set(i, &(existing_address, new_count));
-                return new_count;
+    fn bytes_contains(haystack: &Bytes, needle: &Bytes) -> bool {
+        let haystack_len = haystack.len();
+        let needle_len = needle.len();
+        if needle_len == 0 {
+            return true;
+        }
+        if needle_len > haystack_len {
+            return false;
+        }
+        let last_start = haystack_len - needle_len;
+        for start in 0..=last_start {
+            let mut matched = true;
+            for i in 0..needle_len {
+                let h = haystack.get(start + i).unwrap();
+                let n = needle.get(i).unwrap();
+                if h != n {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return true;
             }
         }
-        counts.push_back((address.clone(), 1u32));
-        1u32
-    }
-
-    fn increment_symbol_count(
-        env: &Env,
-        counts: &mut Vec<(Symbol, u32)>,
-        event_type: Symbol,
-    ) -> u32 {
-        for i in 0..counts.len() {
-            let (existing_type, existing_count) = counts.get(i).unwrap().clone();
-            if existing_type == event_type {
-                let new_count = existing_count + 1;
-                counts.set(i, &(existing_type, new_count));
-                return new_count;
-            }
-        }
-        counts.push_back((event_type.clone(), 1u32));
-        1u32
+        false
     }
 }
 
