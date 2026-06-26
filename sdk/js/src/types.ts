@@ -28,12 +28,11 @@ export enum ContractError {
   NewOwnerIsZero = 6,
   CapNotSet = 7,
   MetadataTooLarge = 8,
-  ContractNotInitialized = 9,
-  TotalEventsOverflow = 10,
-  TimestampOutOfRange = 11,
-  InvalidSignature = 12,
-  ContractPaused = 13,
-  RateLimitExceeded = 14,
+  InvalidSignature = 9,
+  ContractPaused = 10,
+  RateLimitExceeded = 11,
+  NoEventsForType = 14,
+  AlreadyInitialized = 15,
 }
 
 export class AuditLedgerError extends Error {

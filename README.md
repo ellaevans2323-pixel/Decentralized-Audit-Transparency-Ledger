@@ -41,13 +41,14 @@ pub struct Event {
 ```rust
 fn initialize(env: Env, owner: Address, global_max_logs: u32);
 fn log_event(env: Env, submitter: Address, event_type: Symbol, metadata: Bytes) -> u32;
+fn log_events(env: Env, events: Vec<(Address, Symbol, Bytes)>) -> Vec<u32>;
 ```
 
 ### Read
 
 ```rust
 fn total_events(env: Env) -> u32;
-fn get_event(env: Env, index: u32) -> Event;
+fn get_event(env: Env, id: BytesN<32>) -> Event;
 fn event_count(env: Env, event_type: Symbol) -> u32;
 fn get_event_by_type(env: Env, event_type: Symbol, type_index: u32) -> Event;
 ```
@@ -82,7 +83,29 @@ cargo clippy
 ### Prerequisites
 
 - Rust toolchain (install via [rustup](https://rustup.rs/))
-- Soroban SDK (included as a Cargo dependency)
+- WASM target: `rustup target add wasm32-unknown-unknown`
+- Soroban CLI: `cargo install soroban-cli --features opt`
+- Docker & Docker Compose (for local infrastructure)
+- Node.js 20+ (for UI and metrics exporter)
+
+### Local Contract Iteration
+
+The fastest way to iterate on the contract locally:
+
+```bash
+# 1. Build and test in one cycle
+cargo build && cargo test
+
+# 2. Run a single test to narrow down issues
+cargo test test_log_event
+
+# 3. Format and lint before committing
+cargo fmt --check && cargo clippy -- -D warnings
+
+# 4. Build the WASM binary for size checks
+cargo build --target wasm32-unknown-unknown --release
+ls -lh target/wasm32-unknown-unknown/release/audit_ledger.wasm
+```
 
 ### Build for WASM
 
@@ -90,7 +113,21 @@ cargo clippy
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-### Deploy with Soroban CLI
+### Deploy to Testnet
+
+**Using the deploy script (recommended):**
+
+```bash
+# Set your secret key (never commit this)
+export SOROBAN_SECRET_KEY="<your_secret_key>"
+
+# Run the deployment script
+./scripts/deploy_testnet.sh
+```
+
+The script validates required environment variables, builds the WASM binary, and deploys it to Stellar testnet. See `scripts/deploy_testnet.sh` for details.
+
+**Using the Soroban CLI directly:**
 
 ```bash
 soroban contract deploy \
@@ -100,6 +137,8 @@ soroban contract deploy \
 ```
 
 ### Initialize
+
+The contract must only be initialized once. Repeated calls to `initialize()` will revert with `AlreadyInitialized`.
 
 ```bash
 soroban contract invoke \
@@ -111,6 +150,35 @@ soroban contract invoke \
   --owner <owner_address> \
   --global_max_logs 100000
 ```
+
+### Local Docker Stack
+
+Run the full monitoring and UI stack locally:
+
+```bash
+# Copy and configure environment variables
+cp .env.example .env
+
+# Start all services
+docker compose up --build
+```
+
+- UI: http://localhost:3001
+- Grafana: http://localhost:3000
+- Prometheus metrics: http://localhost:9090
+
+### Environment Variables
+
+Copy `.env.example` to `.env` and configure the required variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CONTRACT_ID` | Yes | — | Deployed contract ID |
+| `RPC_URL` | No | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
+| `NETWORK` | No | `testnet` | Stellar network passphrase |
+| `SCRAPE_INTERVAL_MS` | No | `15000` | Metrics exporter poll interval |
+| `EVENT_TYPES` | No | `payment,refund,transfer` | Event types to track |
+| `GRAFANA_PASSWORD` | No | `admin` | Grafana admin password |
 
 ## Test Coverage (22 tests)
 
