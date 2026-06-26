@@ -10,6 +10,15 @@ export interface Event {
   prev_hash: Bytes32;
 }
 
+export interface ContractStatistics {
+  total_events: number;
+  events_by_type: Array<[string, number]>;
+  events_last_hour: number;
+  events_last_day: number;
+  events_last_week: number;
+  top_submitters: Array<[string, number]>;
+}
+
 export enum ContractError {
   CallerNotOwner = 1,
   GlobalMaxLogsReached = 2,
